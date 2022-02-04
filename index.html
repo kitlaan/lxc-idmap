@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>lxc.idmap GUI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script>
+        function IdMap(ct_uid, ct_gid, ht_uid, ht_gid, qty) {
+            return {
+                ct_uid,
+                ct_gid,
+                ht_uid,
+                ht_gid,
+                qty,
+                isValid() {
+                    return ((this.ct_uid != null && this.ht_uid != null) ||
+                            (this.ct_gid != null && this.ht_gid != null)) &&
+                           this.qty > 0;
+                },
+                isContiguous(ct_uid, ct_gid, ht_uid, ht_gid) {
+                    return this.ct_uid + this.qty == ct_uid &&
+                           this.ct_gid + this.qty == ct_gid &&
+                           this.ht_uid + this.qty == ht_uid &&
+                           this.ht_gid + this.qty == ht_gid;
+                }
+            };
+        };
+
+        function app() {
+            return {
+                config: [],
+                parseConfig(event) {
+                    const text = event.target.value.split("\n");
+                    let errorcheck = '';
+
+                    // parse out the text into individual id pairs
+                    let invalid = false;
+                    let cuids = [];
+                    let huids = [];
+                    let cgids = [];
+                    let hgids = [];
+                    for (let line of text) {
+                        // skip any self-generated errors
+                        if (line.startsWith("#ERROR>>> ")) {
+                            continue;
+                        }
+
+                        // build the error output, if any
+                        errorcheck += line + '\n';
+                        if (invalid) {
+                            // passthrough after the first error to prevent flood of messages
+                            continue;
+                        }
+
+                        // strip off comments and whitespace for parsing
+                        let t = line.replace(/#.*$/, '').trim();
+                        if (t == '') {
+                            continue;
+                        }
+
+                        // parse!
+                        let m = t.match(/^lxc\.idmap\s+=\s+(?<type>[ug])\s(?<cid>\d+)\s(?<hid>\d+)\s+(?<qty>\d+)$/);
+                        if (!m) {
+                            errorcheck += "#ERROR>>> invalid lxc.idmap format\n";
+                            invalid = true;
+                            continue;
+                        }
+
+                        // build the raw table
+                        m = {
+                            type: m.groups.type,
+                            cid: parseInt(m.groups.cid),
+                            hid: parseInt(m.groups.hid),
+                            qty: parseInt(m.groups.qty)
+                        };
+
+                        if (m.type == 'u') {
+                            for (let x = 0; x < m.qty; x++) {
+                                let cid = m.cid + x;
+                                let hid = m.hid + x;
+                                if (!cuids[cid]) {
+                                    cuids[cid] = IdMap(cid, null, hid, null, 1);
+                                }
+                                else {
+                                    errorcheck += "#ERROR>>> duplicate CT UID (" + cid + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+                                if (!huids[hid]) {
+                                    huids[hid] = IdMap(cid, null, hid, null, 1);
+                                }
+                                else {
+                                    errorcheck += "#ERROR>>> duplicate HOST UID (" + hid + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+                            }
+                        }
+                        else if (m.type == 'g') {
+                            for (let x = 0; x < m.qty; x++) {
+                                let cid = m.cid + x;
+                                let hid = m.hid + x;
+                                if (!cgids[cid]) {
+                                    cgids[cid] = IdMap(null, cid, null, hid, 1);
+                                }
+                                else {
+                                    errorcheck += "#ERROR>>> duplicate CT GID (" + cid + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+                                if (!hgids[hid]) {
+                                    hgids[hid] = IdMap(null, cid, null, hid, 1);
+                                }
+                                else {
+                                    errorcheck += "#ERROR>>> duplicate HOST GID (" + hid + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+                            }
+                        }
+                        else {
+                            errorcheck += "#ERROR>>> unknown lxc.idmap type (" + m.type + ")\n";
+                            invalid = true;
+                        }
+                    }
+
+                    // now that we've parsed into a giant array, check for any gaps that we can default fill
+                    if (!invalid) {
+                        for (let x = 0; x < 65536; x++) {
+                            if (!cuids[x]) {
+                                // try the default mapping (0..65535 -> 100000..165535)
+                                if (huids[x + 100000]) {
+                                    errorcheck += "#ERROR>>> could not default map missing CT UID (" + x + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+
+                                cuids[x] = IdMap(x, null, x + 100000, null, 1);
+                                huids[x + 100000] = IdMap(x, null, x + 100000, null, 1);
+                            }
+                            if (!cgids[x]) {
+                                // try the default mapping (0..65535 -> 100000..165535)
+                                if (hgids[x + 100000]) {
+                                    errorcheck += "#ERROR>>> could not default map missing CT GID (" + x + ")\n";
+                                    invalid = true;
+                                    break;
+                                }
+
+                                cgids[x] = IdMap(null, x, null, x + 100000, 1);
+                                hgids[x + 100000] = IdMap(null, x, null, x + 100000, 1);
+                            }
+                        }
+                    }
+
+                    // find all the consecutive runs
+                    let newconfig = [];
+                    if (!invalid) {
+                        newconfig.push(IdMap(cuids[0].ct_uid, cgids[0].ct_gid, cuids[0].ht_uid, cgids[0].ht_gid, 1));
+                        for (let x = 1; x < 65536; x++) {
+                            if (newconfig[newconfig.length-1].isContiguous(cuids[x].ct_uid, cgids[x].ct_gid, cuids[x].ht_uid, cgids[x].ht_gid)) {
+                                newconfig[newconfig.length-1].qty++;
+                            }
+                            else {
+                                newconfig.push(IdMap(cuids[x].ct_uid, cgids[x].ct_gid, cuids[x].ht_uid, cgids[x].ht_gid, 1));
+                            }
+
+                            // TODO: figure out contiguous of just UID or just GID
+                        }
+                        // TODO: drop any rows that are "default mapping"
+                    }
+
+                    // update state
+                    event.target.value = errorcheck.trimEnd();
+                    if (invalid) {
+                        event.target.classList.add('bg-red-100');
+                    }
+                    else {
+                        event.target.classList.remove('bg-red-100');
+                        console.log(newconfig);
+                        this.config = newconfig;
+                    }
+                },
+                dumpConfig()  {
+                    // TODO: if we don't do the contiguous in the GUI rows, we should do it here
+                    let output = '';
+                    for (let x of this.config) {
+                        if (x.isValid()) {
+                            if (x.ct_uid != null) {
+                                output += "lxc.idmap = u " + x.ct_uid + " " + x.ht_uid + " " + x.qty + "\n";
+                            }
+                            if (x.ct_gid != null) {
+                                output += "lxc.idmap = g " + x.ct_gid + " " + x.ht_gid + " " + x.qty + "\n";
+                            }
+                        }
+                    }
+                    return output;
+                },
+                crosscheck(ct, ht) {
+                    return (ct == null && ht == null) || (ct != null && ht != null);
+                }
+            }
+        }
+    </script>
+</head>
+<body class="m-1 p-0 w-auto h-auto">
+    <div x-data="app()">
+        <textarea class="w-full h-80 border font-mono text-sm overflow-x-auto p-1"
+            spellcheck="false" wrap="off"
+            placeholder="# some comment
+lxc.idmap = u 0 100000 1005
+lxc.idmap = g 0 100000 1005
+# we map 1 uid starting from uid 1005 onto 1005, so 1005 → 1005
+lxc.idmap = u 1005 1005 1
+lxc.idmap = g 1005 1005 1
+# we map the rest of 65535 from 1006 upto 101006, so 1006..65535 → 101006..165535
+lxc.idmap = u 1006 101006 64530
+lxc.idmap = g 1006 101006 64530" :value="dumpConfig" @change="parseConfig"></textarea>
+        <div class="select-none">
+            <template x-for="(row, ix) in config" :key="ix">
+                <div class="flex flex-row rounded-md border my-1 p-1"
+                        draggable="true">
+                    <div class="w-8 text-left cursor-move">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-layers"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+                    </div>
+                    <div class="w-8 text-center cursor-pointer"
+                            @click="config.splice(ix, 1)">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-minus-circle"><circle cx="12" cy="12" r="10"></circle><line x1="8" y1="12" x2="16" y2="12"></line></svg>
+                    </div>
+                    <div class="rounded border">
+                        <input class="w-20 px-1 text-right invalid:bg-red-100"
+                                type="text" maxlength="7" pattern="\d*" placeholder="ct uid"
+                                :class="crosscheck(row.ct_uid, row.ht_uid) || 'bg-red-100'"
+                                x-model.number.lazy="row.ct_uid">
+                        :
+                        <input class="w-20 px-1 text-right invalid:bg-red-100"
+                                type="text" maxlength="7" pattern="\d*" placeholder="ct gid"
+                                :class="crosscheck(row.ct_gid, row.ht_gid) || 'bg-red-100'"
+                                x-model.number.lazy="row.ct_gid">
+                    </div>
+                    <div class="px-2">🡆</div>
+                    <div class="rounded border">
+                        <input class="w-20 px-1 text-right invalid:bg-red-100"
+                                type="text" maxlength="7" pattern="\d*" placeholder="host uid"
+                                :class="crosscheck(row.ct_uid, row.ht_uid) || 'bg-red-100'"
+                                x-model.number.lazy="row.ht_uid">
+                        :
+                        <input class="w-20 px-1 text-right invalid:bg-red-100"
+                                type="text" maxlength="7" pattern="\d*" placeholder="host gid"
+                                :class="crosscheck(row.ct_gid, row.ht_gid) || 'bg-red-100'"
+                                x-model.number.lazy="row.ht_gid">
+                    </div>
+                    <div class="rounded border ml-3">
+                        <input class="w-14 px-1 text-right invalid:bg-red-100"
+                                type="text" maxlength="5" pattern="\d*" placeholder="qty"
+                                :class="row.qty > 0 || 'bg-red-100'"
+                                x-model.number.lazy="row.qty">
+                    </div>
+                </div>
+            </template>
+            <div class="flex flex-row rounded border border-white my-1 p-1">
+                <div class="w-8"></div>
+                <div class="w-8 text-left cursor-pointer"
+                        @click="config.push(IdMap(null, null, null, null, 1))">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-plus-circle"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>
+                </div>
+            </div>
+        </div>
+    </div>
+<!--
+    ctrl-z hidden feature?
+-->
+</body>
+</html>
